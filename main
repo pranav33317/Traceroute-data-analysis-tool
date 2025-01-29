@@ -1,0 +1,184 @@
+import requests
+import json
+import time
+import smtplib
+import networkx as nx
+import matplotlib.pyplot as plt
+import pandas as pd
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import matplotlib.pyplot as plt
+
+# Constants
+API_TOKEN = 'YOUR_RIPE_API_TOKEN'  # Replace with your RIPE Atlas API token
+FROM_EMAIL = "your_email@example.com"  # Replace with your email
+EMAIL_PASSWORD = "your_email_password"  # Replace with your email password
+TO_EMAIL = "recipient_email@example.com"  # Replace with recipient's email
+
+
+def fetch_traceroute_data(target):
+    """
+    Fetch traceroute data from RIPE Atlas API for the given target.
+    """
+    api_url = "https://atlas.ripe.net/api/v2/measurements/"
+    headers = {"Authorization": f"Bearer {API_TOKEN}"}
+
+    params = {
+        "description": "Traceroute for " + target,
+        "type": "traceroute",
+        "target": target,
+        "af": 4,  # IPv4
+        "size": 56,
+        "protocol": "ICMP",
+        "is_oneoff": True,
+        "resolver_ids": "any",  # Use any resolver
+        "tags": ["network"]
+    }
+
+    response = requests.post(f"{api_url}create/", json=params, headers=headers)
+
+    if response.status_code == 200:
+        data = response.json()
+        measurement_id = data['id']
+        print(f"Measurement started. ID: {measurement_id}")
+        return measurement_id
+    else:
+        print("Error triggering measurement")
+        return None
+
+
+def get_traceroute_results(measurement_id):
+    """
+    Fetch results from the triggered traceroute measurement.
+    """
+    result_url = f"https://atlas.ripe.net/api/v2/measurements/{measurement_id}/results/"
+    response = requests.get(result_url)
+
+    if response.status_code == 200:
+        return response.json()  # Parsed traceroute results
+    else:
+        print("Error fetching results.")
+        return None
+
+
+def parse_traceroute_data(traceroute_results):
+    """
+    Parse the traceroute data to extract hops, IP addresses, and ASNs.
+    """
+    hops = []
+
+    for result in traceroute_results:
+        hop = {
+            'hop_number': result['hop'],
+            'ip_address': result.get('from', None),
+            'asn': result.get('asn', None),
+            'latency': result.get('rtt', None)
+        }
+        hops.append(hop)
+
+    return hops
+
+
+def create_network_graph(traceroute_data):
+    """
+    Create a network graph from the traceroute data.
+    """
+    G = nx.Graph()
+
+    for hop in traceroute_data:
+        hop_node = hop['ip_address']
+        # Add the node (IP address)
+        if hop_node:
+            G.add_node(hop_node, asn=hop['asn'], latency=hop['latency'])
+
+        # Connect hops
+        if len(traceroute_data) > 1:
+            for i in range(len(traceroute_data) - 1):
+                G.add_edge(traceroute_data[i]['ip_address'], traceroute_data[i + 1]['ip_address'])
+
+    return G
+
+
+def plot_network_graph(G):
+    """
+    Visualize the network graph using matplotlib.
+    """
+    pos = nx.spring_layout(G)
+    nx.draw(G, pos, with_labels=True, node_size=500, node_color='skyblue', font_size=10, font_weight='bold')
+    plt.title("Network Topology")
+    plt.show()
+
+
+def send_email_alert(subject, body, to_email):
+    """
+    Send email alert if network anomaly is detected.
+    """
+    msg = MIMEMultipart()
+    msg['From'] = FROM_EMAIL
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+
+    try:
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(FROM_EMAIL, EMAIL_PASSWORD)
+        text = msg.as_string()
+        server.sendmail(FROM_EMAIL, to_email, text)
+        server.quit()
+        print("Email sent successfully.")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+
+def store_traceroute_data(traceroute_data, filename='traceroute_data.csv'):
+    """
+    Store traceroute data in a CSV file for later analysis.
+    """
+    df = pd.DataFrame(traceroute_data)
+    df.to_csv(filename, index=False)
+    print(f"Data saved to {filename}")
+
+
+def load_traceroute_data(filename='traceroute_data.csv'):
+    """
+    Load previously stored traceroute data from a CSV file.
+    """
+    return pd.read_csv(filename)
+
+
+def monitor_latency(target, threshold=100):
+    """
+    Monitor latency over time, and send an email if latency exceeds a threshold.
+    """
+    # Fetch new traceroute data
+    measurement_id = fetch_traceroute_data(target)
+    if measurement_id is None:
+        return
+
+    # Wait for the measurement to complete
+    print("Waiting for measurement results...")
+    time.sleep(30)  # Wait for results to be available (this could be adjusted)
+
+    traceroute_results = get_traceroute_results(measurement_id)
+    if traceroute_results:
+        parsed_data = parse_traceroute_data(traceroute_results)
+
+        # Store data
+        store_traceroute_data(parsed_data)
+
+        # Create a graph for visualization
+        G = create_network_graph(parsed_data)
+        plot_network_graph(G)
+
+        # Check for anomalies (latency spikes above the threshold)
+        for hop in parsed_data:
+            if hop['latency'] and hop['latency'] > threshold:
+                subject = f"High Latency Alert: {target}"
+                body = f"Detected high latency ({hop['latency']} ms) on hop {hop['hop_number']} to IP {hop['ip_address']}."
+                send_email_alert(subject, body, TO_EMAIL)
+
+
+if __name__ == "__main__":
+    target = input("Enter the target hostname or IP address for traceroute: ")
+    monitor_latency(target)
